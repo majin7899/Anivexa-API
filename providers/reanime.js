@@ -8,13 +8,96 @@ var BASE = "https://reanime.to";
 var FLIX = "https://flixcloud.cc";
 var ANIZIP2 = "https://api.ani.zip/mappings";
 var UA5 = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
-var H = { "User-Agent": UA5, Accept: "application/json, */*" };
+
+// Fuller, more browser-realistic header set. The original H only sent
+// User-Agent + Accept, which is a very thin fingerprint for a WAF/anti-bot
+// system to key off of — a real browser sends a lot more than that on
+// every request.
+var H = {
+  "User-Agent": UA5,
+  "Accept": "application/json, text/plain, */*",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Accept-Encoding": "gzip, deflate, br",
+  "Referer": `${BASE}/`,
+  "Origin": BASE,
+  "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"Windows"',
+  "sec-fetch-dest": "empty",
+  "sec-fetch-mode": "cors",
+  "sec-fetch-site": "same-origin"
+};
+
+// ── Cookie handshake ────────────────────────────────────────────────────
+// Many anti-bot layers (Cloudflare, custom WAFs) issue a session/challenge
+// cookie on the first page load and expect it to come back on API calls —
+// a request with zero cookies at all is itself a signal of a script, not a
+// browser. We fetch the homepage once, capture whatever Set-Cookie headers
+// come back, and attach them to every subsequent reanime.to request. The
+// jar is cached in-process (module scope) so this only runs once per Node
+// process lifetime, not once per request.
+var _reanimeCookieJar = null;
+var _reanimeCookiePromise = null;
+
+function _parseSetCookie(res) {
+  // Node's fetch (undici) exposes getSetCookie() on recent versions; fall
+  // back to a single combined header if that's not available.
+  if (typeof res.headers.getSetCookie === "function") {
+    const all = res.headers.getSetCookie();
+    if (all && all.length) {
+      return all.map((c) => c.split(";")[0]).join("; ");
+    }
+  }
+  const single = res.headers.get("set-cookie");
+  if (single) return single.split(",").map((c) => c.split(";")[0].trim()).join("; ");
+  return null;
+}
+__name(_parseSetCookie, "_parseSetCookie");
+
+async function ensureReanimeCookies() {
+  if (_reanimeCookieJar) return _reanimeCookieJar;
+  if (_reanimeCookiePromise) return _reanimeCookiePromise;
+  _reanimeCookiePromise = (async () => {
+    try {
+      const res = await fetch(`${BASE}/`, {
+        headers: {
+          "User-Agent": UA5,
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+          "sec-fetch-dest": "document",
+          "sec-fetch-mode": "navigate",
+          "sec-fetch-site": "none",
+          "upgrade-insecure-requests": "1"
+        }
+      });
+      await res.text().catch(() => null); // drain body, we only want headers
+      const cookies = _parseSetCookie(res);
+      if (cookies) {
+        _reanimeCookieJar = cookies;
+        console.log(`[reanime debug] handshake: captured cookies (${cookies.length} chars)`);
+      } else {
+        console.log(`[reanime debug] handshake: no Set-Cookie header on homepage response (status ${res.status})`);
+      }
+    } catch (e) {
+      console.log(`[reanime debug] handshake: failed —`, e.message || e);
+    }
+    return _reanimeCookieJar;
+  })();
+  return _reanimeCookiePromise;
+}
+__name(ensureReanimeCookies, "ensureReanimeCookies");
+
+async function reanimeHeaders(extra = {}) {
+  const cookies = await ensureReanimeCookies();
+  return { ...H, ...(cookies ? { Cookie: cookies } : {}), ...extra };
+}
+__name(reanimeHeaders, "reanimeHeaders");
 async function searchReanime(query, genre = null, retries = 1) {
   const params = new URLSearchParams({ q: query, limit: 10 });
   if (genre) params.set("genre", genre);
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const data = await fetch(`${BASE}/api/v1/search?${params}`, { headers: H }).then(async (r) => {
+      const data = await fetch(`${BASE}/api/v1/search?${params}`, { headers: await reanimeHeaders() }).then(async (r) => {
         const _raw = await r.text();
         // DEBUG: log the raw status + a snippet of the body for the very
         // first search of a request so we can see exactly what reanime.to
@@ -42,7 +125,7 @@ async function searchReanime(query, genre = null, retries = 1) {
 }
 __name(searchReanime, "searchReanime");
 async function fetchAnimeDetail(animeId) {
-  const res = await fetch(`${BASE}/api/v1/anime/${animeId}`, { headers: H });
+  const res = await fetch(`${BASE}/api/v1/anime/${animeId}`, { headers: await reanimeHeaders() });
   if (!res.ok) return null;
   return res.json().catch(() => null);
 }
@@ -213,7 +296,7 @@ async function resolveSeries(anilistId, ctx = {}) {
 }
 __name(resolveSeries, "resolveSeries");
 async function fetchEpisodesList(animeId, limit = 2000) {
-  const data = await fetch(`${BASE}/api/v1/anime/${animeId}/episodes?${new URLSearchParams({ limit })}`, { headers: H }).then(async (r) => {
+  const data = await fetch(`${BASE}/api/v1/anime/${animeId}/episodes?${new URLSearchParams({ limit })}`, { headers: await reanimeHeaders() }).then(async (r) => {
     const _raw = await r.text();
     if (!r.ok) { const _e = new Error(`reanime episodes ${r.status}`); _e.rawBody = _raw; throw _e; }
     try { return JSON.parse(_raw); } catch (_pe) { _pe.rawBody = _raw; throw _pe; }
@@ -275,13 +358,14 @@ async function resolveStream3(anilistId, audio, ep) {
   const slug = series.animeId;
   const order = { "HD-2": 0, "HD-1": 1 };
   const byPrio = (arr) => arr.slice().sort((a, b) => (order[a.serverName] ?? 9) - (order[b.serverName] ?? 9));
+  const _h = await reanimeHeaders();
   const [watchRes, flixRes] = await Promise.allSettled([
-    fetch(`${BASE}/api/watch/${slug}/${ep}`, { headers: H }).then(async (r) => {
+    fetch(`${BASE}/api/watch/${slug}/${ep}`, { headers: _h }).then(async (r) => {
       const _raw = await r.text();
       if (!r.ok) { const _e = new Error(`watch ${r.status}`); _e.rawBody = _raw; throw _e; }
       try { return JSON.parse(_raw); } catch (_pe) { _pe.rawBody = _raw; throw _pe; }
     }),
-    fetch(`${BASE}/api/flix/${anilistId}/${ep}`, { headers: H }).then(async (r) => {
+    fetch(`${BASE}/api/flix/${anilistId}/${ep}`, { headers: _h }).then(async (r) => {
       const _raw = await r.text();
       if (!r.ok) { const _e = new Error(`flix ${r.status}`); _e.rawBody = _raw; throw _e; }
       try { return JSON.parse(_raw); } catch (_pe) { _pe.rawBody = _raw; throw _pe; }
