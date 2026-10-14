@@ -9,15 +9,28 @@ var FLIX = "https://flixcloud.cc";
 var ANIZIP2 = "https://api.ani.zip/mappings";
 var UA5 = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 var H = { "User-Agent": UA5, Accept: "application/json, */*" };
-async function searchReanime(query, genre = null) {
+async function searchReanime(query, genre = null, retries = 1) {
   const params = new URLSearchParams({ q: query, limit: 10 });
   if (genre) params.set("genre", genre);
-  const data = await fetch(`${BASE}/api/v1/search?${params}`, { headers: H }).then(async (r) => {
-    const _raw = await r.text();
-    if (!r.ok) { const _e = new Error(`reanime search ${r.status}`); _e.rawBody = _raw; throw _e; }
-    try { return JSON.parse(_raw); } catch (_pe) { _pe.rawBody = _raw; throw _pe; }
-  });
-  return Array.isArray(data?.results) ? data.results : [];
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const data = await fetch(`${BASE}/api/v1/search?${params}`, { headers: H }).then(async (r) => {
+        const _raw = await r.text();
+        if (!r.ok) { const _e = new Error(`reanime search ${r.status}`); _e.rawBody = _raw; throw _e; }
+        try { return JSON.parse(_raw); } catch (_pe) { _pe.rawBody = _raw; throw _pe; }
+      });
+      return Array.isArray(data?.results) ? data.results : [];
+    } catch (e) {
+      if (attempt < retries) {
+        await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+        continue;
+      }
+      // Final attempt failed — return empty, same as before, but only
+      // after actually trying again once.
+      return [];
+    }
+  }
+  return [];
 }
 __name(searchReanime, "searchReanime");
 async function fetchAnimeDetail(animeId) {
@@ -37,6 +50,24 @@ function extractAnilistIdFromCover(coverImage) {
   return null;
 }
 __name(extractAnilistIdFromCover, "extractAnilistIdFromCover");
+
+// Run async tasks in small batches instead of all at once, with a short
+// delay between batches, to avoid a thundering-herd burst against
+// reanime.to's search endpoint.
+async function runStaggered(tasks, batchSize = 3, delayMs = 150) {
+  const results = [];
+  for (let i = 0; i < tasks.length; i += batchSize) {
+    const batch = tasks.slice(i, i + batchSize);
+    const batchResults = await Promise.all(batch.map((fn) => fn()));
+    results.push(...batchResults);
+    if (i + batchSize < tasks.length) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  return results;
+}
+__name(runStaggered, "runStaggered");
+
 async function resolveSeries(anilistId, ctx = {}) {
   const cacheKey = `np:match2:reanime:${anilistId}`;
   const cached = cacheGet(cacheKey);
@@ -44,18 +75,54 @@ async function resolveSeries(anilistId, ctx = {}) {
 
   const media = ctx.media ?? await getMedia(anilistId);
   const malId = media?.idMal ?? null;
+  console.log(`[reanime debug] anilistId=${anilistId} media.title=`, media?.title, `media.idMal=${malId}`);
+
   const queries = buildTitleSearchQueries(buildTitles(media, ctx.anizip), 16);
-  const searchRequests = queries.map((query) => searchReanime(query));
+  console.log(`[reanime debug] generated ${queries.length} search queries:`, JSON.stringify(queries));
+
+  const searchTasks = queries.map((query) => () => searchReanime(query));
   if (media?.genres?.includes("Hentai")) {
-    searchRequests.push(...queries.map((query) => searchReanime(query, "Hentai")));
+    for (const query of queries) {
+      searchTasks.push(() => searchReanime(query, "Hentai"));
+    }
   }
 
   const candidates = new Map();
-  await Promise.all(searchRequests.map(async (request) => {
-    for (const r of await request.catch(() => [])) {
+  const searchResults = await runStaggered(searchTasks, 3, 150);
+  searchResults.forEach((results, i) => {
+    console.log(`[reanime debug] query "${queries[i % queries.length]}" -> ${results.length} result(s)`);
+  });
+  for (const results of searchResults) {
+    for (const r of results) {
       if (r?.anime_id && !candidates.has(r.anime_id)) candidates.set(r.anime_id, r);
     }
-  }));
+  }
+  console.log(`[reanime debug] total unique candidates: ${candidates.size}`);
+  for (const [id, r] of candidates) {
+    console.log(`[reanime debug] candidate id=${id} title=`, r.title, `anilist_id=${r.anilist_id}`, `cover=`, r.cover_image);
+  }
+
+  // Fastest pass: reanime.to's search API returns anilist_id directly on
+  // each result now — check that first, before falling back to parsing it
+  // out of a cover image URL or fetching a separate detail page per
+  // candidate. This is the match path that was missing entirely before.
+  for (const [id, r] of candidates) {
+    if (r?.anilist_id != null && Number(r.anilist_id) === Number(anilistId)) {
+      const data = {
+        animeId: id,
+        title: r.title?.english || r.title?.romaji || id,
+        anilistId: Number(anilistId),
+        malId: null,
+        subbed: Number.isFinite(r.subbed) ? r.subbed : null,
+        dubbed: Number.isFinite(r.dubbed) ? r.dubbed : null,
+        episodesCount: Number.isFinite(r.episodes) ? r.episodes : null,
+        matchType: "anilist_id_direct",
+        matchScore: 1,
+      };
+      cacheSet(cacheKey, data, SHOW_IDENTITY_TTL);
+      return data;
+    }
+  }
 
   // Fast pass: AniList CDN cover URLs embed the AniList ID as bx{id}-*.
   // If a candidate's cover image already confirms our ID we can skip detail fetches entirely.
