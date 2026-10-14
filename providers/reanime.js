@@ -16,6 +16,14 @@ async function searchReanime(query, genre = null, retries = 1) {
     try {
       const data = await fetch(`${BASE}/api/v1/search?${params}`, { headers: H }).then(async (r) => {
         const _raw = await r.text();
+        // DEBUG: log the raw status + a snippet of the body for the very
+        // first search of a request so we can see exactly what reanime.to
+        // is actually sending back — real empty JSON, a captcha/challenge
+        // page, or something else. Only logs for "ONE PIECE" to keep noise
+        // down since that query runs on nearly every resolveSeries call.
+        if (query === "ONE PIECE" || query === "Attack on Titan") {
+          console.log(`[reanime debug] raw response for "${query}": status=${r.status} content-type=${r.headers.get("content-type")} body(first 300 chars)=`, _raw.slice(0, 300));
+        }
         if (!r.ok) { const _e = new Error(`reanime search ${r.status}`); _e.rawBody = _raw; throw _e; }
         try { return JSON.parse(_raw); } catch (_pe) { _pe.rawBody = _raw; throw _pe; }
       });
@@ -77,7 +85,15 @@ async function resolveSeries(anilistId, ctx = {}) {
   const malId = media?.idMal ?? null;
   console.log(`[reanime debug] anilistId=${anilistId} media.title=`, media?.title, `media.idMal=${malId}`);
 
-  const queries = buildTitleSearchQueries(buildTitles(media, ctx.anizip), 16);
+  // Cap to the first 2 generated queries (English title, then romaji —
+  // these are the ones that actually matched in testing). The full list
+  // includes 10+ translated variants (Japanese, Arabic, Hebrew, Thai,
+  // Greek, etc.) which: (a) never produced a single match in testing, and
+  // (b) firing that many queries in one language-hopping burst for a
+  // single title is a bot-like pattern that may itself be contributing to
+  // getting flagged/rate-limited by reanime.to. Cutting to 2 shrinks the
+  // burst size by ~85% and keeps only the queries with proven value.
+  const queries = buildTitleSearchQueries(buildTitles(media, ctx.anizip), 16).slice(0, 1);
   console.log(`[reanime debug] generated ${queries.length} search queries:`, JSON.stringify(queries));
 
   const searchTasks = queries.map((query) => () => searchReanime(query));
